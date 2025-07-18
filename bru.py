@@ -1,260 +1,176 @@
-import streamlit as st
+import streamlit as st 
 import geemap.foliumap as geemap
 import ee
+import json
 import pandas as pd
-import numpy as np
-import plotly.express as px
+from plotly.subplots import make_subplots
 import plotly.graph_objects as go
-from datetime import datetime
+from scipy import stats
 
-# Inicialização do Earth Engine
+# Inicializar Earth Engine
 try:
-    ee.Initialize()
-except Exception as e:
-    try:
-        ee.Authenticate()
-        ee.Initialize()
-    except:
-        st.warning("Falha na autenticação do Earth Engine. Verifique suas credenciais.")
+    ee.Initialize(project='ee-serginss-459118')
+except Exception:
+    ee.Authenticate()
+    ee.Initialize(project='ee-serginss-459118')
 
 # Configuração da página
-st.set_page_config(layout="wide", page_title="Monitoramento da Bacia do Rio Pericumã")
-st.title("🌊 Monitoramento da Superfície de Água")
-st.subheader("Bacia Hidrográfica do Rio Pericumã")
+st.set_page_config(layout='wide', page_title="Monitoramento BHRP", page_icon="💧")
+st.title("Monitoramento da Bacia Hidrográfica do Rio Pericumã - MapBiomas Água")
 
-# Carregar a bacia hidrográfica do Earth Engine Assets
-@st.cache_resource
-def load_bacia_from_gee():
-    try:
-        # Carrega a bacia do seu Earth Engine Assets
-        bacia = ee.FeatureCollection('projects/ee-serginss/assets/Bacia_Pericuma_ZEE_v2')
-        
-        # Verifica se a coleção não está vazia
-        size = bacia.size().getInfo()
-        if size == 0:
-            st.error("A coleção de features está vazia")
-            return None, None
-            
-        # Pega a primeira feature e sua geometria
-        first_feature = ee.Feature(bacia.first())
-        geometry = first_feature.geometry()
-        
-        # Verifica se a geometria é válida
-        if geometry.isEmpty().getInfo():
-            st.error("Geometria vazia na feature")
-            return None, None
-            
-        # Obtém propriedades (nome da bacia)
-        properties = first_feature.getInfo().get('properties', {})
-        area_name = properties.get('nome', 'Bacia do Rio Pericumã')
-        
-        return geometry, area_name
-        
-    except Exception as e:
-        st.error(f"Erro ao carregar a bacia do GEE: {str(e)}")
-        return None, None
-
-# Carregar a geometria da bacia
-geometry, area_name = load_bacia_from_gee()
-if geometry:
-    st.success(f"Área de estudo carregada: {area_name}")
-
-# Configurações dos dados do MapBiomas Água
-DATA_CONFIG = {
-    'cobertura_agua_anual': {
-        'asset': 'projects/mapbiomas-public/assets/brazil/water/collection3/mapbiomas_water_annual_water_coverage_v1',
-        'palette': ['#ffffff', '#0101c1'],
-        'years': list(range(1985, 2024)),
-        'band_prefix': 'annual_water_coverage_'
-    },
-    'frequencia_agua': {
-        'asset': 'projects/mapbiomas-public/assets/brazil/water/collection3/mapbiomas_water_frequency_v1',
-        'palette': ['#e5e5ff', '#ccccff', '#b2b2ff', '#9999ff', '#7f7fff', 
-                   '#6666ff', '#4c4cff', '#3232ff', '#1919ff', '#0000ff'],
-        'years': ['1985_2023'],
-        'band_prefix': 'water_frequency_'
+# CSS para os cards
+st.markdown("""
+<style>
+    .metric-card {
+        border-radius: 10px;
+        padding: 15px;
+        background-color: white;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        margin-bottom: 20px;
     }
-}
+    .metric-title { font-size: 16px; color: #555; margin-bottom: 5px; }
+    .metric-value { font-size: 24px; font-weight: bold; color: #2532e4; }
+    .metric-change { font-size: 14px; color: #666; }
+    .positive {color: #2ecc71;}
+    .negative {color: #e74c3c;}
+</style>
+""", unsafe_allow_html=True)
 
-# Carregar os dados do MapBiomas Água
+# --- Carregar a geometria da bacia hidrográfica ---
 @st.cache_resource
-def load_data(data_type):
-    return ee.Image(DATA_CONFIG[data_type]['asset'])
+def load_bacia_geometry():
+    with open('assets/bacia_pericuma_OF.geojson', 'r', encoding='utf-8') as f:
+        geojson_data = json.load(f)
+        geometry = geojson_data['features'][0]['geometry']
+        return ee.Geometry(geometry)
 
-# Sidebar - Controles
-with st.sidebar:
-    st.header("Configurações")
-    
-    data_type = st.selectbox(
-        "Tipo de análise",
-        options=list(DATA_CONFIG.keys()),
-        format_func=lambda x: "Cobertura Anual" if x == "cobertura_agua_anual" else "Frequência"
-    )
-    
-    if data_type == "cobertura_agua_anual":
-        selected_years = st.multiselect(
-            "Selecione os anos",
-            options=DATA_CONFIG[data_type]['years'],
-            default=[2023, 2020, 2015, 2010, 2005, 2000]
-        )
-    else:
-        selected_years = DATA_CONFIG[data_type]['years']
-    
-    buffer_distance = st.select_slider(
-        "Buffer (km)",
-        options=[0, 1, 2, 3, 4, 5],
-        value=0
-    )
-    
-    show_basin = st.checkbox("Mostrar limites da bacia", value=True)
-    opacity = st.slider("Opacidade das camadas", 0.1, 1.0, 0.7)
+geometry = load_bacia_geometry()
 
-# Carregar os dados do MapBiomas
-image = load_data(data_type)
+# Seleção de anos
+anos = list(range(1985, 2024))
+anos_selecionados = st.multiselect(
+    "Selecione o(s) ano(s) para análise:",
+    anos,
+    default=[1985, 1995, 2005, 2015, 2023]
+)
 
-# Aplicar buffer se necessário
-if buffer_distance > 0 and geometry:
-    study_area = geometry.buffer(buffer_distance * 1000)
-elif geometry:
-    study_area = geometry
-else:
-    study_area = None
+# Imagem do MapBiomas
+mapbiomas = ee.Image("projects/mapbiomas-public/assets/brazil/lulc/collection9/mapbiomas_collection90_integration_v1")
+image_clip = mapbiomas.clip(geometry)
 
 # Mapa interativo
-col1, col2 = st.columns([2, 1])
+st.subheader("🗺️ Mapa Interativo - Água na BHRP")
+with st.expander("Clique para expandir o mapa", expanded=True):
+    m = geemap.Map(center=[-2.5, -45], zoom=7)
+    m.addLayer(ee.FeatureCollection([ee.Feature(geometry)]), {"color": "red", "fillColor": "00000000"}, "Bacia Pericumã")
 
-with col1:
-    st.subheader("Visualização Espacial")
-    m = geemap.Map(zoom=9)
-    
-    if geometry:
-        m.centerObject(ee.FeatureCollection(ee.Feature(geometry)), 9)
-    
-    if show_basin and geometry:
-        m.addLayer(ee.FeatureCollection(ee.Feature(geometry)).style(**{'color': 'yellow', 'fillColor': '00000000'}), {}, "Limites da Bacia")
-    
-    if study_area and data_type == "cobertura_agua_anual":
-        for year in selected_years:
-            band_name = f"{DATA_CONFIG[data_type]['band_prefix']}{year}"
-            water_layer = image.select(band_name).clip(study_area)
-            
-            m.addLayer(
-                water_layer,
-                {'min': 0, 'max': 1, 'palette': DATA_CONFIG[data_type]['palette']},
-                f"Água {year}",
-                opacity=opacity
-            )
-    elif study_area and data_type == "frequencia_agua":
-        band_name = f"{DATA_CONFIG[data_type]['band_prefix']}{selected_years[0]}"
-        freq_layer = image.select(band_name).clip(study_area)
-        
-        m.addLayer(
-            freq_layer,
-            {'min': 1, 'max': 36, 'palette': DATA_CONFIG[data_type]['palette']},
-            "Frequência de Água 1985-2023",
-            opacity=opacity
-        )
-    
+    for ano in sorted(anos_selecionados):
+        banda = image_clip.select(f"classification_{ano}")
+        agua = banda.eq(33).selfMask()
+        m.addLayer(agua, {"palette": ["#2532e4"], "opacity": 0.7}, f"Água {ano}")
+
     m.addLayerControl()
-    m.to_streamlit(height=600)
+    m.to_streamlit(height=500)
 
-# Cálculo de estatísticas (apenas se a geometria foi carregada)
-if geometry:
-    with col2:
-        st.subheader(f"Análise Temporal - {area_name}")
-        
-        if data_type == "cobertura_agua_anual":
-            with st.spinner("Calculando séries temporais..."):
-                # Função para calcular área por ano
-                def calculate_area(year):
-                    band_name = f"{DATA_CONFIG[data_type]['band_prefix']}{year}"
-                    water_mask = image.select(band_name)
-                    
-                    area_stats = water_mask.multiply(ee.Image.pixelArea()) \
-                        .reduceRegion(
-                            reducer=ee.Reducer.sum(),
-                            geometry=study_area,
-                            scale=30,
-                            maxPixels=1e13
-                        ).getInfo()
-                    
-                    water_area = area_stats.get(band_name, 0) / 1e6  # Convert to km²
-                    return {'Ano': year, 'Área (km²)': round(water_area, 2)}
-                
-                # Calcular para todos os anos
-                stats_data = [calculate_area(year) for year in DATA_CONFIG[data_type]['years']]
-                df = pd.DataFrame(stats_data)
-                
-                # Gráfico de evolução
-                fig = px.line(
-                    df, 
-                    x="Ano", 
-                    y="Área (km²)",
-                    markers=True,
-                    title=f"Evolução da Superfície de Água - {area_name}",
-                    template="plotly_white"
-                )
-                
-                # Adicionar linha de tendência
-                z = np.polyfit(df['Ano'], df['Área (km²)'], 1)
-                p = np.poly1d(z)
-                df['Tendência'] = p(df['Ano'])
-                
-                fig.add_trace(
-                    go.Scatter(
-                        x=df['Ano'],
-                        y=df['Tendência'],
-                        name='Tendência',
-                        line=dict(color='red', dash='dash')
-                    )
-                )
-                
-                fig.update_layout(
-                    hovermode="x unified",
-                    xaxis_title="Ano",
-                    yaxis_title="Área de Água (km²)",
-                    height=400
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
-                
-                # Tabela de dados
-                st.dataframe(
-                    df.style.format({"Área (km²)": "{:.2f}"})
-                     .highlight_max(subset=["Área (km²)"], color='lightgreen')
-                     .highlight_min(subset=["Área (km²)"], color='#ffcccb')
-                )
-                
-                # Botão de download
-                csv = df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📥 Download dos dados",
-                    data=csv,
-                    file_name=f"area_agua_{area_name.lower().replace(' ', '_')}_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime='text/csv'
-                )
-        else:
-            st.info("""
-            **Análise de Frequência (1985-2023)**
-            
-            Mostra com que frequência cada pixel foi classificado como água no período.
-            - Valores próximos a 1: água esporádica
-            - Valores próximos a 36: água permanente
-            """)
+# Cálculo da área de água
+@st.cache_data
+def calcular_areas_temporais(_geometry):
+    dados = []
+    for ano in range(1985, 2024):
+        banda = image_clip.select(f"classification_{ano}")
+        agua = banda.eq(33)
+        area_m2 = agua.multiply(ee.Image.pixelArea()).reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=_geometry,
+            scale=30,
+            maxPixels=1e13
+        ).getInfo()
+        area_km2 = area_m2.get(f"classification_{ano}", 0) / 1e6
+        dados.append({"Ano": ano, "Área (km²)": round(area_km2, 2)})
+    return pd.DataFrame(dados)
 
-# Informações adicionais
-st.expander("ℹ️ Sobre este dashboard").write(f"""
-Este dashboard monitora a superfície de água na {area_name} utilizando dados do MapBiomas Água Collection 3.
+df_completo = calcular_areas_temporais(geometry)
+df_selecionados = df_completo[df_completo['Ano'].isin(anos_selecionados)]
 
-**Funcionalidades:**
-- Visualização da cobertura anual de água (1985-2023)
-- Análise de frequência de água (permanência)
-- Série temporal da área de água
-- Opção de buffer para análise da área entorno
+# Cálculo de métricas
+if len(anos_selecionados) >= 2:
+    a_ini = df_selecionados.iloc[0]['Área (km²)']
+    a_fim = df_selecionados.iloc[-1]['Área (km²)']
+    var_abs = a_fim - a_ini
+    var_pct = (var_abs / a_ini) * 100 if a_ini != 0 else 0
 
-**Dados utilizados:**
-- [MapBiomas Água Collection 3](https://mapbiomas.org/)
-- Bacia hidrográfica carregada de: `projects/ee-serginss/assets/Bacia_Pericuma_ZEE_v2`
+    x = df_completo['Ano'].values
+    y = df_completo['Área (km²)'].values
+    slope, intercept, r_value, _, _ = stats.linregress(x, y)
+    trend_km2_ano = slope
+    trend_pct_ano = (slope / y.mean()) * 100 if y.mean() != 0 else 0
 
-Desenvolvido por LAGEOS/LAB - Universidade Estadual do Maranhão
-""")
+# Cards de Métricas
+if len(anos_selecionados) >= 2:
+    st.subheader("📊 Métricas de Variação")
+    cols = st.columns(4)
+    with cols[0]:
+        st.markdown(f"""<div class="metric-card"><div class="metric-title">Área Inicial ({anos_selecionados[0]})</div><div class="metric-value">{a_ini:.2f} km²</div></div>""", unsafe_allow_html=True)
+    with cols[1]:
+        st.markdown(f"""<div class="metric-card"><div class="metric-title">Área Final ({anos_selecionados[-1]})</div><div class="metric-value">{a_fim:.2f} km²</div></div>""", unsafe_allow_html=True)
+    with cols[2]:
+        change_class = "positive" if var_abs >= 0 else "negative"
+        icon = "↑" if var_abs >= 0 else "↓"
+        st.markdown(f"""<div class="metric-card"><div class="metric-title">Variação Absoluta</div><div class="metric-value">{var_abs:.2f} km²</div><div class="metric-change {change_class}">{icon} {abs(var_pct):.1f}%</div></div>""", unsafe_allow_html=True)
+    with cols[3]:
+        trend_class = "positive" if trend_km2_ano >= 0 else "negative"
+        icon2 = "↑" if trend_km2_ano >= 0 else "↓"
+        st.markdown(f"""<div class="metric-card"><div class="metric-title">Tendência (1985-2023)</div><div class="metric-value">{trend_km2_ano:.3f} km²/ano</div><div class="metric-change {trend_class}">{icon2} {trend_pct_ano:.2f}%/ano</div></div>""", unsafe_allow_html=True)
+
+# Gráfico temporal
+st.subheader("📈 Série Temporal da Área de Água na BHRP")
+fig = make_subplots()
+fig.add_trace(go.Scatter(
+    x=df_completo['Ano'],
+    y=df_completo['Área (km²)'],
+    mode='lines',
+    name='Área de Água',
+    line=dict(color='#2532e4', width=3)
+))
+fig.add_trace(go.Scatter(
+    x=df_selecionados['Ano'],
+    y=df_selecionados['Área (km²)'],
+    mode='markers+text',
+    name='Anos Selecionados',
+    marker=dict(color='red', size=10),
+    text=df_selecionados['Área (km²)'].round(2).astype(str) + ' km²',
+    textposition='top center'
+))
+fig.add_trace(go.Scatter(
+    x=df_completo['Ano'],
+    y=intercept + slope * df_completo['Ano'],
+    mode='lines',
+    name='Tendência Linear',
+    line=dict(color='orange', dash='dash')
+))
+fig.update_layout(
+    title="Variação da Área de Água - Bacia do Rio Pericumã (1985-2023)",
+    xaxis_title="Ano",
+    yaxis_title="Área (km²)",
+    template="plotly_white",
+    hovermode="x unified",
+    height=500
+)
+st.plotly_chart(fig, use_container_width=True)
+
+# Tabela com dados
+st.subheader("📋 Tabela de Áreas Anuais - BHRP")
+df_show = df_completo.copy()
+df_show['Variação Anual (km²)'] = df_show['Área (km²)'].diff()
+df_show['Variação Anual (%)'] = df_show['Área (km²)'].pct_change() * 100
+df_show['Variação Acumulada (%)'] = (df_show['Área (km²)'] / df_show['Área (km²)'].iloc[0] - 1) * 100
+df_show = df_show.round(2)
+
+st.dataframe(df_show, use_container_width=True)
+
+st.download_button(
+    label="📥 Baixar CSV",
+    data=df_show.to_csv(index=False).encode('utf-8'),
+    file_name="bhrp_area_agua_1985_2023.csv",
+    mime='text/csv'
+)
